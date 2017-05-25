@@ -1,0 +1,177 @@
+
+require:
+   escape-string-regexp as esc
+
+provide:
+   DefParser
+
+var __id = 0
+gensym() =
+   __id += 1
+   '$G{__id}'
+
+word-sequence(chars) =
+   if chars.length === 1:
+      #char{chars}
+   else:
+      #sequence{*cs} where cs = chars each c -> #char{c}
+
+parse-parts(text, word-transform = word-sequence) =
+   results = text.split(R" +|\\([a-zA-Z_]+)|(.)-(.)|([^ ]+)")
+   0...(results.length // 5) each idx ->
+      r = results[(idx*5) ... ((idx + 1)*5)]
+      match r:
+         {_, undefined?, undefined?, undefined?, undefined?} ->
+            continue
+         {_, ref, undefined?, undefined?, undefined?} ->
+            #ref{ref}
+         {_, undefined?, start, end, undefined?} ->
+            #range{start, end}
+         {_, undefined?, undefined?, undefined?, chars} ->
+            word-transform(chars)
+
+parse-line(line) =
+   pos = line.index-of(":")
+   {header, defn} = {line[...pos].trim(), line[(pos + 1)...].trim()}
+   {type, group = null} = header.split(R" +")
+   data = match type:
+      .C ->
+         #choice{*parse-parts(defn)}
+      .W ->
+         #repeat{#choice{*parse-parts(defn)}, 1, null}
+      "*" ->
+         #repeat{#choice{*parse-parts(defn)}, 0, null}
+      .S ->
+         #sequence{*parse-parts(defn)}
+      .O ->
+         #opdef{*parse-parts(defn, transform)} where transform(match chars) =
+            R"[0-9]+"? num ->
+               #prio{Number! num}
+            else ->
+               #word{chars}
+   {group, data}
+
+
+
+pattern-prefix = """
+* PSPC:  \\SPACE
+W PBODY: A-Z a-z 0-9 \\BACKSLASH
+S PATT:  \\PSPC \\BACKSLASH \\PBODY \\PSPC
+S OPATT: \\BACKSLASH : \\PBODY
+O:  9999 \\PATT 9999
+O:  9999 \\OPATT 9999
+"""
+
+class DefParser:
+
+   constructor(var spec, @add-patterns = false) =
+      @lex-groups = {=}
+      @lex-raw = {=}
+      @oper-raw = {}
+      @lex = {
+         NEWLINE = "\n"
+         TAB = "\t"
+         SPACE = " "
+         BACKSLASH = "\\\\"
+         ANY = "."
+      }
+
+      if @add-patterns:
+         spec = pattern-prefix + spec
+      @regexps = {}
+      @regexps-rev = {=}
+      @opgroups = {=}
+      @opdefs = {=}
+
+      @parse-spec(spec)
+      @compile-spec()
+
+   parse-spec(spec) =
+      spec.split("\n") each line when line.trim() ->
+         {var g, data} = parse-line(line)
+         g or= gensym()
+         match data:
+            #opdef{*defs} ->
+               @oper-raw.push with {g, defs}
+               @oper-raw.push with {gensym(), ___} with defs each
+                  #ref{x} -> #word{'\\:{x}'}
+                  other -> other
+            else ->
+               s = gensym()
+               @lex-groups[s] = {s}
+               @lex-groups[g] =
+                  match @lex-groups[g]:
+                     undefined? ->
+                        {s}
+                     gs ->
+                        gs ++ {s}
+               @lex-raw[s] = data
+
+   compile-spec() =
+      helper-lex(match part) =
+         #ref{name} ->
+            if not @lex[name]:
+               parts = @lex-groups[name] each x -> helper-lex(@lex-raw[x])
+               @lex[name] = "(?:" + parts.join("|") + ")"
+            @lex[name]
+         #char{c} ->
+            esc(c)
+         #range{s, e} ->
+            '[{s}-{e}]'
+         #sequence{*parts} ->
+            ___.join("") with parts each p -> helper-lex(p)
+         #choice{*parts} ->
+            ('(?:' + ___.join("|") + ')') with parts each p -> helper-lex(p)
+         #repeat{p, *match} ->
+            {1, null?} ->
+               '(?:' + helper-lex(p) + ')+'
+            {0, null?} ->
+               '(?:' + helper-lex(p) + ')*'
+            {m, n} ->
+               '(?:' + helper-lex(p) + ')\{{m or ""},{n or ""}\}'
+         else ->
+            throw E.invalid-regexp{part}
+
+      referred = {=}
+      @oper-raw each {_, defn} ->
+         defn each
+            #ref{name} ->
+               @lex-groups[name] each part ->
+                  referred[part] = @lex-raw[part]
+            else ->
+               pass
+
+      helper-oper(defn) =
+         groups = enumerate(defn.neighbours(3)) each {i, x} when (i mod 2) == 0 -> x
+         groups each {#prio{Number! lp}, oper, #prio{Number! rp}} ->
+            {name, code} =
+               match oper:
+                  #ref{name} ->
+                     {name, name}
+                  #word{w} ->
+                     f() where f() =
+                        items(referred) each {name, s} ->
+                           r = new RegExp('^{helper-lex(s)}$')
+                           if r? w:
+                              return {name, '{name} {w}'}
+                        let name = gensym()
+                        @lex-groups[name] = {name}
+                        @lex-raw[name] = oper
+                        name
+                  else ->
+                     let name = gensym()
+                     @lex-groups[name] = {name}
+                     @lex-raw[name] = oper
+                     name
+            g = gensym()
+            @opdefs[g] = {left = lp, right = rp}
+            if code == name:
+               @opgroups[g] = @lex-groups[name]
+               @lex-groups[name] each part ->
+                  @regexps-rev[part] = name
+                  @regexps.push with {part, helper-lex(#ref{part})}
+            else:
+               @opgroups[g] = {code}
+
+      @oper-raw each {name, defn} ->
+         helper-oper(defn)

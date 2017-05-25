@@ -1,0 +1,31 @@
+{
+  "name": "language-wizard",
+  "description": "Define and implement simple programming languages",
+  "version": "0.0.0",
+  "format": "cjs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/breuleux/language-wizard"
+  },
+  "keywords": [],
+  "author": "Olivier Breuleux",
+  "license": "MIT",
+  "main": "./lib/index.js",
+  "dependencies": {
+    "earlgrey-runtime": "^0.1.0",
+    "escape-string-regexp": "^1.0.5",
+    "kaiser": "0.0.4",
+    "opg": "0.0.5"
+  },
+  "devDependencies": {
+    "earlgrey": "^0.1.0",
+    "mocha": "^3.2.0",
+    "earl-mocha": "^0.1.0"
+  },
+  "scripts": {
+    "refresh": "earl compile -5vso lib/ src/",
+    "compile": "earl compile -5rvso lib/ src/",
+    "prepublish": "npm run compile",
+    "test": "mocha"
+  }
+}

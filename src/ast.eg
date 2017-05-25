@@ -1,0 +1,363 @@
+
+require:
+   .def -> DefParser
+   opg ->
+      Source, Location
+      transfer-location as [<<:]
+      tokenize ->
+         Tokenizer, infer-location
+      parse as xyz ->
+         Parser, TokenGroups, PriorityOrder
+
+inject:
+   options
+
+provide:
+   QAst, Text, Patt, Seq
+   Spec, Dispatcher
+   parse, parse-pattern
+
+class QAst:
+   constructor() =
+      pass
+   raw() =
+      @location.text() !! e ->
+         throw E.noraw{'Cannot get a raw string from {@}.'}
+   empty() =
+      @raw().trim() == ""
+   sexp() = [@]
+   args() = [@]
+   extract(*specs) =
+      extractor(*specs)(@)
+
+QAst.prototype &: options.methods or {=}
+
+_ts = Symbol("text")
+class Text(QAst):
+   constructor(x) =
+      @0 = x
+      @length = 1
+   key() =
+      't:' + @0
+   type-key() =
+      'p:' + @token-type
+   [^Symbol.clone]() =
+      Text{@0}
+   "::serialize"() =
+      {_ts, @0}
+
+_os = Symbol("oper")
+class Oper(Text):
+   constructor(x) =
+      @0 = x
+      @length = 1
+      @operator-token = @0.trim()
+   key() =
+      't:' + @operator-token
+   type-key() =
+      'p:' + @token-type
+   [^Symbol.clone]() =
+      Oper{@0}
+   "::serialize"() =
+      {_os, @0}
+
+_ps = Symbol("patt")
+class Patt(QAst):
+   constructor(name) =
+      @0 = name
+      @length = 1
+   key() =
+      'p:' + @0
+   type-key() =
+      'p:' + @token-type
+   [^Symbol.clone]() =
+      Patt{@0}
+   "::serialize"() =
+      {_ps, @0}
+
+;; _os = Symbol("oper")
+;; class Oper(QAst):
+;;    constructor(x) =
+;;       @0 = x
+;;       @length = 1
+;;    key() =
+;;       'o:' + @0
+;;    [^Symbol.clone]() =
+;;       Oper{@0}
+;;    "::serialize"() =
+;;       {_os, @0}
+
+_ss = Symbol("seq")
+class Seq(QAst):
+   constructor(*xs) =
+      self = [@]
+      enumerate(xs) each {i, x} ->
+         self[i] = x
+      @length = xs.length
+   key() =
+      's' + @1.key()
+   type-key() =
+      'sp:' + @operator-type
+   [^Symbol.clone]() =
+      rval = Seq(*[enumerate{@} each {_, x} -> x])
+      rval.operator = @operator
+      rval.location = @location
+      rval
+   gen [^Symbol.iterator]() =
+      let self = [@]
+      0...@length each i ->
+         yield self[i]
+   "::serialize"() =
+      {_ss, enumerate(@) each {_, x} -> x}
+
+   sexp(recursive = true) =
+      operators = {}
+      newargs = {}
+      enumerate(@) each {match i, arg} ->
+         when i mod 2 == 0 ->
+            newargs.push with
+               if recursive:
+                  then: arg.sexp(recursive)
+                  else: arg
+         else ->
+            operators.push(arg[0])
+      {operators.join(" "), *newargs}
+   args() =
+      @sexp(false)[1...]
+
+   ;; .collapse{} =
+   ;;    collapse{@[1][0], @}
+
+
+find-insert{xs, x, ord} =
+   var lo = 0
+   var hi = xs.length - 1
+   while lo <= hi:
+      mid = lo + [[hi - lo] // 2]
+      match ord{xs[mid], x}:
+         < 0  -> lo = mid + 1
+         > 0  -> hi = mid - 1
+         else -> return {mid, true}
+   {lo, false}
+
+insert-sorted{xs, x, ord} =
+   {idx, replace} = find-insert{xs, x, ord}
+   xs.splice{idx, if{replace, 1, 0}, x}
+
+parse-spec{match} =
+   String? spec ->
+      let ast = parse-pattern{spec}
+      var specificity = 0
+      rval = helper{ast, {shed = true}} where helper{match expr, opts} =
+         Patt? ->
+            #put{expr[0], expr.tags.has(.maybe), expr.filter-type or null}
+         Text? ->
+            specificity += 100
+            #eq{expr}
+         Seq? {*args} and {=> operator} ->
+            specificity += 1
+            #seq{*[args each arg -> helper{arg, opts}]}
+      top =
+         if Patt? ast and not ast.filter-type:
+            "*:"
+         else:
+            ast.key{}
+      {top, rval, specificity}
+   {top, rval, specificity} ->
+      {top, rval, specificity}
+
+make-extractor{parse-spec! {top, tree, specificity}} =
+   helper{match x, node} =
+      #put{v, _maybe = true, type-filter = null} ->
+         match node:
+            Text? {""} when not _maybe ->
+               false
+            {token-type => != type-filter} when type-filter != null ->
+               false
+            else ->
+               {v => node}
+      #eq{match other} ->
+         Oper? ->
+            node.operator-token == other.operator-token
+         Text? ->
+            node[0] == other[0]
+         else ->
+            false
+      #seq{*subtrees} ->
+         match node:
+            Seq? {*args} when subtrees.length == args.length ->
+               rval = {=}
+               zip{subtrees, args} each {subtree, arg} ->
+                  match helper{subtree, arg}:
+                     false? ->
+                        return false
+                     vars ->
+                        rval &: vars
+               rval
+            other ->
+               false
+      #fn{f} ->
+         f{node}
+   {top, specificity, fn} where
+      fn{node} = helper{tree, node}
+
+rule-bank = {=}
+
+extractor{*match} =
+   {rules and not String?} ->
+      extractors = items{rules} each {name, match rule} ->
+         when rule-bank[rule] -> {name, rule-bank[rule]}
+         else ->
+            {_, _, ex} = make-extractor{rule}
+            rule-bank[rule] = ex
+            {name, ex}
+      f{node} =
+         extractors each {name, ex} ->
+            if [res = ex{node}]:
+               return res &: {_which = name}
+         return false
+      f[Symbol.project-no-exc]{x} =
+         match f{x}:
+            === false ->
+               {false, null}
+            values ->
+               {true, values}
+      f
+   rules ->
+      extractor{object with enumerate{rules}}
+
+
+
+
+create-parser(defn, inject-patterns = false) =
+   dp = DefParser(defn, inject-patterns)
+
+   tokenizer = Tokenizer with {
+      regexps = dp.regexps
+      post = {infer-location}
+   }
+   groups = TokenGroups(dp.opgroups)
+   prio = PriorityOrder(groups, dp.opdefs)
+
+   make-leaf({=> token, => location, => var type}, Type = Text) =
+      type = dp.regexps-rev[type]
+      rval =
+         match type:
+            .PATT ->
+               {*tags, name} = token.trim().split("\\")[1...]
+               Patt(name) &: {tags = new Set(tags)}
+            .OPATT ->
+               {*tags, name} = token.trim().split(R"\\:?")[1...]
+               Patt(name) &: {tags = new Set(tags), filter-type = name}
+            else ->
+               Type(token)
+      (rval <<: location) &: {
+         token-type = type
+      }
+      
+
+   finalize(match node) =
+      {null?, mid, null?} ->
+         make-leaf(mid)
+      else ->
+         res = Seq(*elems) where elems =
+            parts = node
+            enumerate(node) each {match i, x} ->
+               when (i mod 2) === 0 ->
+                  match x:
+                     null? ->
+                        Text("") <<: Location{src, s, e} where
+                           p0 = parts[i - 1]
+                           p1 = parts[i + 1]
+                           s = if{p0, p0.location.end, p1.location.start}
+                           e = if{p1, p1.location.start, p0.location.end}
+                           src = if{p0, p0.location.source, p1.location.source}
+                     else ->
+                        x
+               else ->
+                  make-leaf(x, Oper)
+         res &: {
+            operator = res[1].operator-token
+            operator-type = res[1].token-type
+            location = Location(
+               res[0].location.source
+               res[0].location.start
+               res[res.length - 1].location.end
+            )
+         }
+         res
+
+   Parser(tokenizer, prio.get-order(), finalize)
+
+pattern-prefix = """
+W __body:  A-Z a-z 0-9 \\BACKSLASH
+S __patt:  \\BACKSLASH \\__body
+O:  9999 \\__patt 9999
+"""
+
+parser = create-parser(options.definitions)
+pattern-parser = create-parser(options.definitions, true)
+
+parse(match s) =
+   String? ->
+      parser.parse(Source(s))
+   Source? ->
+      parser.parse(s)
+
+parse-pattern(match s) =
+   String? ->
+      pattern-parser.parse(Source(s))
+   Source? ->
+      pattern-parser.parse(s)
+
+class Spec:
+   constructor{make-extractor! {@operator, @specificity, @extractor}, @gen} =
+      pass
+   [^Symbol.project-no-exc]{@extractor! match} =
+      false? ->
+         {false, null}
+      values ->
+         {true, values}
+
+class Dispatcher:
+
+   constructor{} =
+      @dispatch = {}
+
+   .gen(node) =
+      @handlers(node) each {parts, spec} ->
+         return spec.gen(@, parts)
+      throw E.no-rule{node.key()}
+
+   gen handlers{node} =
+      let keys = {node.key(), node.type-key(), "*:"}
+      keys each key ->
+         match @dispatch[key]:
+            undefined? ->
+               false
+            candidates ->
+               candidates each c ->
+                  match node:
+                     c! parts ->
+                        yield {parts, c}
+                     else ->
+                        pass
+               false
+
+   register{*match} =
+      {Spec? handler} ->
+         key = handler.operator
+         l = [@dispatch[key] or= {}]
+         insert-sorted{l, handler} with
+            {{specificity => match s1}, {specificity => s2}} ->
+               ;; Do not return 0 because it will cause a replacement
+               > s2 -> -1
+               else -> 1
+      {rule, fn} ->
+         @register{Spec{rule, fn}}
+
+   clone{} =
+      d = Dispatcher{}
+      d.dispatch = object with items{@dispatch} each {key, l} ->
+         {key, l.slice{0}}
+      d
